@@ -8,7 +8,7 @@ WORKDIR /service
 
 COPY pyproject.toml ./
 COPY app ./app
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir ".[dev]" \
     && groupadd --gid 10001 api \
     && useradd --uid 10001 --gid api --no-create-home api
 
