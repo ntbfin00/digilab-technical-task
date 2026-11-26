@@ -17,7 +17,7 @@ import wandb
 from numpy.typing import NDArray
 
 from app.core.cnn_training import CNNConfig, CNNTrainer
-from app.services.data_service import DataService
+from app.services.data_service import DataService, PreparedDataset
 
 
 @dataclass(frozen=True)
@@ -69,11 +69,21 @@ class TrainingService:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Training service is shut down")
+        prepared = DataService().prepare_upload(input_features, target, input_feature_labels)
+        return self.submit_prepared(prepared, config)
+
+    def submit_prepared(self, prepared: PreparedDataset,
+                        config: CNNConfig | None = None) -> TrainingRun:
+        """Snapshot prepared data and preserve its ID before queue acceptance."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Training service is shut down")
+        if not isinstance(prepared, PreparedDataset):
+            raise TypeError("prepared must be PreparedDataset")
         if config is None:
             config = CNNConfig()
         if not isinstance(config, CNNConfig):
             raise TypeError("config must be CNNConfig")
-        prepared = DataService().prepare_upload(input_features, target, input_feature_labels)
         trainer = CNNTrainer(**asdict(config))
         trainer.load_dataset(prepared.training_data)
         snapshot = TrainingRun(uuid4(), prepared.dataset_id, total_steps=config.epochs)
@@ -254,6 +264,12 @@ class TrainingService:
         with self._lock:
             self._closed = True
         self._worker.shutdown(wait=True)
+
+    @property
+    def is_shutdown(self) -> bool:
+        """Whether draining has started and the service rejects new work."""
+        with self._lock:
+            return self._closed
 
     def __enter__(self) -> "TrainingService":
         return self

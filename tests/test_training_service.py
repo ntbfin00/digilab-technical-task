@@ -226,6 +226,29 @@ class TrainingServiceTests(unittest.TestCase):
         self.assertEqual(service._runs, {})
         self.mocks[1].assert_not_called()
 
+    def test_prepared_submission_preserves_id_and_snapshots_before_accepting(self):
+        service = self.service()
+        prepared = DataService().prepare_upload(self.x, self.y, ["a", "b"])
+        with patch("app.services.training_service.DataService.prepare_upload") as prepare:
+            submitted = service.submit_prepared(prepared, self.config)
+        prepare.assert_not_called()
+        self.assertEqual(submitted.dataset_id, prepared.dataset_id)
+        copied = self.trainers[0]._data[1].copy()
+        prepared.training_data.target.values[:] = -100
+        np.testing.assert_array_equal(self.trainers[0]._data[1], copied)
+        self.trainers[0].release.set()
+        service.shutdown()
+        with self.assertRaisesRegex(RuntimeError, "shut down"):
+            service.submit_prepared(prepared)
+
+    def test_prepared_scheduling_failure_rolls_back(self):
+        service = self.service()
+        prepared = DataService().prepare_upload(self.x, self.y, ["a", "b"])
+        with patch.object(service._worker, "submit", side_effect=RuntimeError("cannot schedule")):
+            with self.assertRaises(RuntimeError):
+                service.submit_prepared(prepared)
+        self.assertEqual(service._runs, {})
+
     def test_submission_and_polling_do_not_wait_for_network_initialization(self):
         entered, release = Event(), Event()
 

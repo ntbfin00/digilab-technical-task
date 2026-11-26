@@ -1,6 +1,10 @@
 """Dataset preparation and framework independence tests."""
 
 import subprocess
+from io import BytesIO
+import lzma
+import warnings
+import zipfile
 import sys
 import unittest
 from unittest.mock import patch
@@ -9,10 +13,111 @@ from uuid import UUID
 import numpy as np
 
 from app.core.data import TrainingData
-from app.services.data_service import DataService, PreparedDataset
+from app.services.data_service import (DataService, PreparedDataset, InvalidArchiveError,
+                                       DatasetTooLargeError)
+
+
+def malformed_npz_archives():
+    """Real malformed Unicode and LZMA payloads, shared with HTTP regressions."""
+    arrays = dict(input_features=np.ones((3, 2)), target=np.arange(3).reshape(3, 1),
+                  input_feature_labels=np.array(["a", "b"]))
+    unicode_archive = BytesIO()
+    np.savez(unicode_archive, **(arrays | {
+        "input_feature_labels": np.array([0x110000, ord("b")], dtype=np.uint32).view("U1"),
+    }))
+    compressed = BytesIO()
+    with zipfile.ZipFile(compressed, "w", compression=zipfile.ZIP_LZMA) as archive:
+        for name, array in arrays.items():
+            member = BytesIO()
+            np.save(member, array, allow_pickle=False)
+            archive.writestr(f"{name}.npy", member.getvalue())
+        entry = archive.infolist()[0]
+        start = entry.header_offset + 30 + len(entry.filename.encode()) + len(entry.extra)
+    corrupted = bytearray(compressed.getvalue())
+    # Preserve the ZIP LZMA prefix; corrupt its five-byte filter properties.
+    corrupted[start + 4:start + 9] = b"\xff" * 5
+    return {"unicode": unicode_archive.getvalue(), "lzma": bytes(corrupted)}
 
 
 class DataServiceTests(unittest.TestCase):
+    def archive(self, **overrides):
+        values = dict(input_features=np.ones((3, 2)), target=np.ones((3, 1)),
+                      input_feature_labels=np.array(["a", "b"]))
+        values.update(overrides)
+        output = BytesIO()
+        np.savez_compressed(output, **values)
+        output.seek(0)
+        return output
+
+    def test_npz_delegates_once_and_preserves_labels(self):
+        with patch.object(self.service, "prepare_upload", wraps=self.service.prepare_upload) as prepare:
+            result = self.service.prepare_npz(self.archive(target=self.target))
+        prepare.assert_called_once()
+        self.assertEqual(prepare.call_args.args[2], ["a", "b"])
+        self.assertIsInstance(result.dataset_id, UUID)
+        np.testing.assert_array_equal(prepare.call_args.args[1], self.target)
+        np.testing.assert_array_equal(result.training_data.target.values, self.target)
+
+    def test_npz_malformed_unicode_and_lzma_are_normalized(self):
+        for kind, payload in malformed_npz_archives().items():
+            with self.subTest(kind=kind):
+                # Verify the fixture actually reproduces the low-level failure.
+                with self.assertRaises(SystemError if kind == "unicode" else lzma.LZMAError):
+                    with np.load(BytesIO(payload), allow_pickle=False) as archive:
+                        if kind == "unicode":
+                            archive["input_feature_labels"].tolist()
+                        else:
+                            archive["input_features"]
+                with patch.object(self.service, "prepare_upload") as prepare:
+                    with self.assertRaises(InvalidArchiveError):
+                        self.service.prepare_npz(BytesIO(payload))
+                    prepare.assert_not_called()
+
+    def test_npz_invalid_members_dtypes_and_structures(self):
+        cases = [BytesIO(b"not zip"), self.archive(extra=np.ones(1)),
+                 self.archive(input_feature_labels=np.array([b"a", b"b"])),
+                 self.archive(input_feature_labels=np.array([["a", "b"]])),
+                 self.archive(input_features=np.array([[object()]], dtype=object)),
+                 self.archive(input_features=np.ones(3)),
+                 self.archive(input_features=np.ones((3, 2), dtype=complex)),
+                 self.archive(target=np.ones((2, 1)))]
+        missing = BytesIO()
+        np.savez(missing, target=np.ones((3, 1)))
+        cases.append(missing)
+        duplicate = self.archive()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(duplicate, "a") as archive:
+                archive.writestr("target.npy", b"bad")
+        cases.append(duplicate)
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaises(InvalidArchiveError):
+                    self.service.prepare_npz(source)
+
+    def test_npz_limits_precede_array_loading(self):
+        for limits in ({"max_compressed_bytes": 1}, {"max_expanded_bytes": 1}):
+            with self.subTest(limits=limits), patch("app.services.data_service.np.load") as load:
+                with self.assertRaises(DatasetTooLargeError):
+                    DataService(**limits).prepare_npz(self.archive())
+                load.assert_not_called()
+
+    def test_npz_forged_header_rejected_before_allocation(self):
+        for shape, error in (((10**12, 2), DatasetTooLargeError), ((3, 2), InvalidArchiveError)):
+            header = BytesIO()
+            np.lib.format.write_array_header_1_0(header, {
+                "descr": "<f8", "fortran_order": False, "shape": shape})
+            source = self.archive()
+            output = BytesIO()
+            with zipfile.ZipFile(source) as original, zipfile.ZipFile(output, "w") as archive:
+                for entry in original.infolist():
+                    archive.writestr(entry.filename, header.getvalue() if entry.filename == "input_features.npy"
+                                     else original.read(entry))
+            with patch("app.services.data_service.np.load") as load:
+                with self.assertRaises(error):
+                    self.service.prepare_npz(output)
+                load.assert_not_called()
+
     def setUp(self):
         self.service = DataService()
         self.features = np.arange(6, dtype=float).reshape(3, 2)
