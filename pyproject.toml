@@ -13,6 +13,7 @@ dependencies = [
     "torch>=2.6,<3",
     "xarray>=2025.1,<2027",
     "uvicorn>=0.34,<1",
+    "wandb>=0.19.10,<1",
 ]
 
 [project.optional-dependencies]
